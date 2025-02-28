@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.types.{AbstractArrayType, StringTypeWithCollation}
 import org.apache.spark.sql.types._
 
 class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
@@ -62,26 +63,6 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
 
   override def dateTimeOperationsRule: TypeCoercionRule = AnsiTypeCoercion.DateTimeOperations
 
-  private def shouldCastStringLiteral(to: AbstractDataType, expected: DataType): Unit = {
-    val input = Literal("123")
-    val castResult = AnsiTypeCoercion.implicitCast(input, to)
-    assert(DataType.equalsIgnoreCaseAndNullability(
-      castResult.map(_.dataType).getOrElse(null), expected),
-      s"Failed to cast String literal to $to")
-  }
-
-  private def shouldNotCastStringLiteral(to: AbstractDataType): Unit = {
-    val input = Literal("123")
-    val castResult = AnsiTypeCoercion.implicitCast(input, to)
-    assert(castResult.isEmpty, s"Should not be able to cast String literal to $to")
-  }
-
-  private def shouldNotCastStringInput(to: AbstractDataType): Unit = {
-    val input = AttributeReference("s", StringType)()
-    val castResult = AnsiTypeCoercion.implicitCast(input, to)
-    assert(castResult.isEmpty, s"Should not be able to cast non-foldable String input to $to")
-  }
-
   private def checkWidenType(
       widenFunc: (DataType, DataType) => Option[DataType],
       t1: DataType,
@@ -99,24 +80,15 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     }
   }
 
-  test("implicit type cast - unfoldable StringType") {
-    val nonCastableTypes = allTypes.filterNot(_ == StringType)
-    nonCastableTypes.foreach { dt =>
-      shouldNotCastStringInput(dt)
-    }
-    shouldNotCastStringInput(DecimalType)
-    shouldNotCastStringInput(NumericType)
-  }
-
-  test("implicit type cast - foldable StringType") {
-    atomicTypes.foreach { dt =>
-      shouldCastStringLiteral(dt, dt)
-    }
-    allTypes.filterNot(atomicTypes.contains).foreach { dt =>
-      shouldNotCastStringLiteral(dt)
-    }
-    shouldCastStringLiteral(DecimalType, DecimalType.defaultConcreteType)
-    shouldCastStringLiteral(NumericType, DoubleType)
+  test("implicit type cast - StringType") {
+    val checkedType = StringType
+    val nonCastableTypes =
+      complexTypes ++ Seq(NullType, CalendarIntervalType)
+    checkTypeCasting(checkedType, castableTypes = allTypes.filterNot(nonCastableTypes.contains))
+    shouldCast(checkedType, DecimalType, DecimalType.SYSTEM_DEFAULT)
+    shouldCast(checkedType, NumericType, NumericType.defaultConcreteType)
+    shouldCast(checkedType, AnyTimestampType, AnyTimestampType.defaultConcreteType)
+    shouldNotCast(checkedType, IntegralType)
   }
 
   test("implicit type cast - unfoldable ArrayType(StringType)") {
@@ -151,6 +123,26 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     shouldNotCast(checkedType, DecimalType)
     shouldNotCast(checkedType, NumericType)
     shouldNotCast(checkedType, IntegralType)
+  }
+
+  test("wider data type of two for string") {
+    def widenTest(t1: DataType, t2: DataType, expected: Option[DataType]): Unit = {
+      checkWidenType(AnsiTypeCoercion.findWiderTypeForTwo, t1, t2, expected)
+      checkWidenType(AnsiTypeCoercion.findWiderTypeForTwo, t2, t1, expected)
+    }
+
+    widenTest(NullType, StringType, Some(StringType))
+    widenTest(StringType, StringType, Some(StringType))
+    Seq(ByteType, ShortType, IntegerType, LongType).foreach { dt =>
+      widenTest(dt, StringType, Some(LongType))
+    }
+    Seq(FloatType, DecimalType(20, 10), DoubleType).foreach { dt =>
+      widenTest(dt, StringType, Some(DoubleType))
+    }
+
+    Seq(DateType, TimestampType, BinaryType, BooleanType).foreach { dt =>
+      widenTest(dt, StringType, Some(dt))
+    }
   }
 
   test("tightest common bound for types") {
@@ -408,7 +400,7 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
 
     ruleTest(rule,
       Coalesce(Seq(timestampLit, stringLit)),
-      Coalesce(Seq(timestampLit, stringLit)))
+      Coalesce(Seq(timestampLit, Cast(stringLit, TimestampType))))
 
     ruleTest(rule,
       Coalesce(Seq(nullLit, floatNullLit, intLit)),
@@ -422,7 +414,8 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     // There is no a common type among Float/Double/String
     ruleTest(rule,
       Coalesce(Seq(nullLit, floatNullLit, doubleLit, stringLit)),
-      Coalesce(Seq(nullLit, floatNullLit, doubleLit, stringLit)))
+      Coalesce(Seq(Cast(nullLit, DoubleType), Cast(floatNullLit, DoubleType),
+        doubleLit, Cast(stringLit, DoubleType))))
 
     // There is no a common type among Timestamp/Int/String
     ruleTest(rule,
@@ -451,8 +444,8 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
         :: Literal("a")
         :: Nil),
       CreateArray(Literal(1.0)
-        :: Literal(1)
-        :: Literal("a")
+        :: Cast(Literal(1), DoubleType)
+        :: Cast(Literal("a"), DoubleType)
         :: Nil))
 
     ruleTest(AnsiTypeCoercion.FunctionArgumentConversion,
@@ -468,9 +461,9 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
         :: Literal.create(null, DecimalType(22, 10))
         :: Literal.create(null, DecimalType(38, 38))
         :: Nil),
-      CreateArray(Literal.create(null, DecimalType(5, 3)).cast(DecimalType(38, 38))
-        :: Literal.create(null, DecimalType(22, 10)).cast(DecimalType(38, 38))
-        :: Literal.create(null, DecimalType(38, 38))
+      CreateArray(Literal.create(null, DecimalType(5, 3)).cast(DecimalType(38, 26))
+        :: Literal.create(null, DecimalType(22, 10)).cast(DecimalType(38, 26))
+        :: Literal.create(null, DecimalType(38, 38)).cast(DecimalType(38, 26))
         :: Nil))
   }
 
@@ -506,7 +499,7 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
         :: Literal(3.0)
         :: Nil),
       CreateMap(Literal(1)
-        :: Literal("a")
+        :: Cast(Literal("a"), DoubleType)
         :: Literal(2)
         :: Literal(3.0)
         :: Nil))
@@ -517,19 +510,19 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
         :: Literal.create(null, DecimalType(38, 38))
         :: Nil),
       CreateMap(Literal(1)
-        :: Literal.create(null, DecimalType(38, 0)).cast(DecimalType(38, 38))
+        :: Literal.create(null, DecimalType(38, 0))
         :: Literal(2)
-        :: Literal.create(null, DecimalType(38, 38))
+        :: Literal.create(null, DecimalType(38, 38)).cast(DecimalType(38, 0))
         :: Nil))
     // type coercion for both map keys and values
     ruleTest(AnsiTypeCoercion.FunctionArgumentConversion,
-      CreateMap(Literal(1)
-        :: Literal("a")
+      CreateMap(Cast(Literal(1), DoubleType)
+        :: Cast(Literal("a"), DoubleType)
         :: Literal(2.0)
         :: Literal(3.0)
         :: Nil),
       CreateMap(Cast(Literal(1), DoubleType)
-        :: Literal("a")
+        :: Cast(Literal("a"), DoubleType)
         :: Literal(2.0)
         :: Literal(3.0)
         :: Nil))
@@ -644,11 +637,11 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
 
     ruleTest(rule,
       If(falseLit, stringLit, doubleLit),
-      If(falseLit, stringLit, doubleLit))
+      If(falseLit, Cast(stringLit, DoubleType), doubleLit))
 
     ruleTest(rule,
       If(trueLit, timestampLit, stringLit),
-      If(trueLit, timestampLit, stringLit))
+      If(trueLit, timestampLit, Cast(stringLit, TimestampType)))
   }
 
   test("type coercion for CaseKeyWhen") {
@@ -878,7 +871,7 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     val wp1 = widenSetOperationTypes(union.select(p1.output.head, $"p2.v"))
     assert(wp1.isInstanceOf[Project])
     // The attribute `p1.output.head` should be replaced in the root `Project`.
-    assert(wp1.expressions.forall(_.find(_ == p1.output.head).isEmpty))
+    assert(wp1.expressions.forall(!_.exists(_ == p1.output.head)))
     val wp2 = widenSetOperationTypes(Aggregate(Nil, sum(p1.output.head).as("v") :: Nil, union))
     assert(wp2.isInstanceOf[Aggregate])
     assert(wp2.missingInput.isEmpty)
@@ -901,7 +894,8 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     )
     ruleTest(inConversion,
       In(Literal("a"), Seq(Literal(1), Literal("b"))),
-      In(Literal("a"), Seq(Literal(1), Literal("b")))
+      In(Cast(Literal("a"), LongType),
+        Seq(Cast(Literal(1), LongType), Cast(Literal("b"), LongType)))
     )
   }
 
@@ -1024,55 +1018,6 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
       IntegralDivide(Cast(2, LongType), 1L))
   }
 
-  test("Promote string literals") {
-    val rule = AnsiTypeCoercion.PromoteStringLiterals
-    val stringLiteral = Literal("123")
-    val castStringLiteralAsInt = Cast(stringLiteral, IntegerType)
-    val castStringLiteralAsDouble = Cast(stringLiteral, DoubleType)
-    val castStringLiteralAsDate = Cast(stringLiteral, DateType)
-    val castStringLiteralAsTimestamp = Cast(stringLiteral, TimestampType)
-    ruleTest(rule,
-      GreaterThan(stringLiteral, Literal(1)),
-      GreaterThan(castStringLiteralAsInt, Literal(1)))
-    ruleTest(rule,
-      LessThan(Literal(true), stringLiteral),
-      LessThan(Literal(true), Cast(stringLiteral, BooleanType)))
-    ruleTest(rule,
-      EqualTo(Literal(Array(1, 2)), stringLiteral),
-      EqualTo(Literal(Array(1, 2)), stringLiteral))
-    ruleTest(rule,
-      GreaterThan(stringLiteral, Literal(0.5)),
-      GreaterThan(castStringLiteralAsDouble, Literal(0.5)))
-
-    val dateLiteral = Literal(java.sql.Date.valueOf("2021-01-01"))
-    ruleTest(rule,
-      EqualTo(stringLiteral, dateLiteral),
-      EqualTo(castStringLiteralAsDate, dateLiteral))
-
-    val timestampLiteral = Literal(Timestamp.valueOf("2021-01-01 00:00:00"))
-    ruleTest(rule,
-      EqualTo(stringLiteral, timestampLiteral),
-      EqualTo(castStringLiteralAsTimestamp, timestampLiteral))
-
-    ruleTest(rule, Add(stringLiteral, Literal(1)),
-      Add(castStringLiteralAsInt, Literal(1)))
-    ruleTest(rule, Divide(stringLiteral, Literal(1)),
-      Divide(castStringLiteralAsInt, Literal(1)))
-
-    ruleTest(rule,
-      In(Literal(1), Seq(stringLiteral, Literal(2))),
-      In(Literal(1), Seq(castStringLiteralAsInt, Literal(2))))
-    ruleTest(rule,
-      In(Literal(1.0), Seq(stringLiteral, Literal(2.2))),
-      In(Literal(1.0), Seq(castStringLiteralAsDouble, Literal(2.2))))
-    ruleTest(rule,
-      In(dateLiteral, Seq(stringLiteral)),
-      In(dateLiteral, Seq(castStringLiteralAsDate)))
-    ruleTest(rule,
-      In(timestampLiteral, Seq(stringLiteral)),
-      In(timestampLiteral, Seq(castStringLiteralAsTimestamp)))
-  }
-
   test("SPARK-35937: GetDateFieldOperations") {
     val ts = Literal(Timestamp.valueOf("2021-01-01 01:30:00"))
     Seq(
@@ -1081,5 +1026,57 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
       ruleTest(
         AnsiTypeCoercion.GetDateFieldOperations, operation(ts), operation(Cast(ts, DateType)))
     }
+  }
+
+  test("SPARK-49188: implicit casts of arrays") {
+    // Valid casts when inner type is non-complex type.
+    shouldCast(
+      ArrayType(IntegerType),
+      AbstractArrayType(IntegerType),
+      ArrayType(IntegerType))
+    shouldCast(
+      ArrayType(StringType),
+      AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true)),
+      ArrayType(StringType))
+    shouldCast(
+      ArrayType(IntegerType),
+      AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true)),
+      ArrayType(StringType))
+    shouldCast(
+      ArrayType(StringType),
+      AbstractArrayType(IntegerType),
+      ArrayType(IntegerType))
+
+    // Valid casts when inner type is array of non-complex types.
+    shouldCast(
+      ArrayType(ArrayType(IntegerType)),
+      AbstractArrayType(AbstractArrayType(IntegerType)),
+      ArrayType(ArrayType(IntegerType)))
+    shouldCast(
+      ArrayType(ArrayType(StringType)),
+      AbstractArrayType(AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true))),
+      ArrayType(ArrayType(StringType)))
+    shouldCast(
+      ArrayType(ArrayType(IntegerType)),
+      AbstractArrayType(AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true))),
+      ArrayType(ArrayType(StringType)))
+    shouldCast(
+      ArrayType(ArrayType(StringType)),
+      AbstractArrayType(AbstractArrayType(IntegerType)),
+      ArrayType(ArrayType(IntegerType)))
+
+    // Invalid casts involving casting arrays into non-complex types.
+    shouldNotCast(ArrayType(IntegerType), IntegerType)
+    shouldNotCast(ArrayType(StringType), StringTypeWithCollation(supportsTrimCollation = true))
+    shouldNotCast(ArrayType(StringType), IntegerType)
+    shouldNotCast(ArrayType(IntegerType), StringTypeWithCollation(supportsTrimCollation = true))
+
+    // Invalid casts involving casting arrays of arrays into arrays of non-complex types.
+    shouldNotCast(ArrayType(ArrayType(IntegerType)), AbstractArrayType(IntegerType))
+    shouldNotCast(ArrayType(ArrayType(StringType)),
+      AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true)))
+    shouldNotCast(ArrayType(ArrayType(StringType)), AbstractArrayType(IntegerType))
+    shouldNotCast(ArrayType(ArrayType(IntegerType)),
+      AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true)))
   }
 }
